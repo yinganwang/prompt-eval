@@ -242,10 +242,11 @@ _CATEGORY_DISPLAY = {
 }
 
 
-def print_summary(results: list[dict]) -> None:
+def print_summary(results: list[dict], show_std: bool = False) -> None:
     """Print a formatted summary table of evaluation results."""
     col_width = 10
-    header = f"{'Prompt':<25} {'Accuracy':>8}  "
+    acc_col = f"{'Accuracy (±std)' if show_std else 'Accuracy':>16}"
+    header = f"{'Prompt':<25} {acc_col}  "
     for cat in CATEGORIES:
         display = _CATEGORY_DISPLAY.get(cat, cat[:col_width])
         header += f"{display:>{col_width}}  "
@@ -260,7 +261,11 @@ def print_summary(results: list[dict]) -> None:
     best_prompt = None
 
     for r in results:
-        line = f"{r['prompt_name']:<25} {r['accuracy']:>7.1%}  "
+        if show_std and "accuracy_std" in r:
+            acc_str = f"{r['accuracy']:>7.1%} ±{r['accuracy_std']:.1%}"
+        else:
+            acc_str = f"{r['accuracy']:>7.1%}"
+        line = f"{r['prompt_name']:<25} {acc_str:>16}  "
         for cat in CATEGORIES:
             cat_acc = r["per_category"][cat]["accuracy"]
             line += f"{cat_acc:>{col_width}.1%}  "
@@ -275,6 +280,39 @@ def print_summary(results: list[dict]) -> None:
     print(f"\nWinner: {best_prompt} ({best_accuracy:.1%} accuracy)")
 
 
+def average_results(runs: list[list[dict]]) -> list[dict]:
+    """Average accuracy and cost across multiple runs of the same prompts."""
+    averaged = []
+    for prompt_idx in range(len(runs[0])):
+        base = runs[0][prompt_idx]
+        n = len(runs)
+
+        avg_accuracy = sum(r[prompt_idx]["accuracy"] for r in runs) / n
+        std_accuracy = (
+            sum((r[prompt_idx]["accuracy"] - avg_accuracy) ** 2 for r in runs) / n
+        ) ** 0.5
+        avg_cost = sum(r[prompt_idx]["cost_estimate_usd"] for r in runs) / n
+
+        per_category: dict[str, dict] = {}
+        for cat in CATEGORIES:
+            cat_acc_values = [r[prompt_idx]["per_category"][cat]["accuracy"] for r in runs]
+            per_category[cat] = {
+                "correct": runs[-1][prompt_idx]["per_category"][cat]["correct"],
+                "total": base["per_category"][cat]["total"],
+                "accuracy": sum(cat_acc_values) / n,
+            }
+
+        averaged.append({
+            **base,
+            "accuracy": avg_accuracy,
+            "accuracy_std": std_accuracy,
+            "cost_estimate_usd": avg_cost,
+            "per_category": per_category,
+            "num_runs": n,
+        })
+    return averaged
+
+
 async def main() -> None:
     parser = argparse.ArgumentParser(
         description="Evaluate prompt variants for ticket classification."
@@ -282,7 +320,14 @@ async def main() -> None:
     parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="Run only 5 tickets per prompt for quick testing.",
+        help="Run only 1 ticket per category (5 total) for quick testing.",
+    )
+    parser.add_argument(
+        "--repeat",
+        type=int,
+        default=1,
+        metavar="N",
+        help="Run the full eval N times and report mean ± std accuracy (default: 1).",
     )
     args = parser.parse_args()
 
@@ -301,29 +346,37 @@ async def main() -> None:
         tickets = sampled
         print(f"Dry-run mode: using {len(tickets)} tickets")
 
-    print(f"Evaluating {len(PROMPT_VARIANTS)} prompts × {len(tickets)} tickets")
+    repeat = max(1, args.repeat)
+    print(f"Evaluating {len(PROMPT_VARIANTS)} prompts × {len(tickets)} tickets"
+          + (f" × {repeat} runs" if repeat > 1 else ""))
     print(f"Model: {MODEL}\n")
 
     client = anthropic.AsyncAnthropic()
-    all_results = []
+    all_runs: list[list[dict]] = []
 
-    for name, fn in PROMPT_VARIANTS.items():
-        print(f"Running {name}...", end=" ", flush=True)
-        start = time.monotonic()
-        result = await evaluate_prompt(client, name, fn, tickets)
-        elapsed = time.monotonic() - start
-        errors = sum(1 for d in result["details"] if d["error"])
-        parse_failures = sum(
-            1 for d in result["details"]
-            if d["predicted_label"] is None and d["error"] is None
-        )
-        print(
-            f"{result['accuracy']:.1%} "
-            f"({elapsed:.1f}s, {errors} errors, {parse_failures} parse failures)"
-        )
-        all_results.append(result)
+    for run_idx in range(repeat):
+        if repeat > 1:
+            print(f"── Run {run_idx + 1}/{repeat} ──")
+        run_results = []
+        for name, fn in PROMPT_VARIANTS.items():
+            print(f"Running {name}...", end=" ", flush=True)
+            start = time.monotonic()
+            result = await evaluate_prompt(client, name, fn, tickets)
+            elapsed = time.monotonic() - start
+            errors = sum(1 for d in result["details"] if d["error"])
+            parse_failures = sum(
+                1 for d in result["details"]
+                if d["predicted_label"] is None and d["error"] is None
+            )
+            print(
+                f"{result['accuracy']:.1%} "
+                f"({elapsed:.1f}s, {errors} errors, {parse_failures} parse failures)"
+            )
+            run_results.append(result)
+        all_runs.append(run_results)
 
-    print_summary(all_results)
+    all_results = average_results(all_runs) if repeat > 1 else all_runs[0]
+    print_summary(all_results, show_std=repeat > 1)
 
     # Save results.
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
@@ -334,7 +387,8 @@ async def main() -> None:
         "model": MODEL,
         "num_tickets": len(tickets),
         "dry_run": args.dry_run,
-        "results": all_results,
+        "num_runs": repeat,
+        "results": all_results if isinstance(all_results, list) else [all_results],
     }
     with open(output_path, "w") as f:
         json.dump(output, f, indent=2)
